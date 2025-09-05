@@ -1,0 +1,232 @@
+import os
+import time
+import json
+import re
+from urllib.parse import urlencode
+
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, jsonify, redirect, request, session, send_from_directory
+from flask_cors import CORS
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = Flask(__name__, static_folder="static")
+CORS(app, supports_credentials=True)
+
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change-me")
+
+MLH_AUTH_URL = "https://my.mlh.io/oauth/authorize"
+MLH_TOKEN_URL = "https://my.mlh.io/oauth/token"
+MLH_API_ME = "https://api.mlh.com/v4/users/me"
+
+CLIENT_ID = os.environ.get("MLH_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("MLH_CLIENT_SECRET")
+REDIRECT_URI = os.environ.get("MLH_REDIRECT_URI")
+SEASON = os.environ.get("SEASON", "2025")
+
+# --- Simple in-memory cache for events ---
+_events_cache = {
+    "data": None,
+    "fetched_at": 0,
+    "ttl": 6 * 60 * 60,  # 6 hours
+}
+
+
+@app.route("/")
+def root():
+    return send_from_directory(app.static_folder, "index.html")
+
+
+# 1) Start OAuth: send user to MLH consent page
+@app.route("/auth/mlh")
+def auth_mlh():
+    params = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": "user:read:profile user:read:email offline_access",
+        "state": "xyz123",
+    }
+    return redirect(f"{MLH_AUTH_URL}?{urlencode(params)}")
+
+
+# 2) Callback: MLH redirects here with ?code=
+@app.route("/auth/mlh/callback")
+def auth_mlh_callback():
+    code = request.args.get("code")
+    if not code:
+        return jsonify({"error": "Missing code"}), 400
+
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    token_res = requests.post(MLH_TOKEN_URL, data=data, headers=headers, timeout=30)
+
+    if token_res.status_code != 200:
+        return jsonify({"error": "Token exchange failed", "details": token_res.text}), 400
+
+    tokens = token_res.json()
+    session["mlh_access_token"] = tokens.get("access_token")
+    session["mlh_refresh_token"] = tokens.get("refresh_token")
+    session["mlh_token_type"] = tokens.get("token_type")
+    session["mlh_expires_in"] = tokens.get("expires_in")
+
+    # Redirect back to UI (root) now that we're logged in
+    return redirect("/")
+
+
+# 3) Get current user profile
+@app.route("/api/me")
+def api_me():
+    access_token = session.get("mlh_access_token")
+    if not access_token:
+        return jsonify({"logged_in": False}), 401
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    # request expanded fields if you need them
+    params = [("expand[]", "education"), ("expand[]", "professional_experience")]
+    res = requests.get(MLH_API_ME, headers=headers, params=params, timeout=30)
+
+    if res.status_code != 200:
+        return jsonify({"error": "Failed to fetch profile", "status": res.status_code, "body": res.text}), 400
+
+    me = res.json()
+    return jsonify({"logged_in": True, "user": me})
+
+
+# 4) Scrape & cache MLH season events -> JSON for chatbot
+#    NOTE: HTML can change. We try JSON-LD first, then fallback to CSS parsing.
+
+def _parse_events_from_html(html: str):
+    soup = BeautifulSoup(html, "lxml")
+    events = []
+
+    # Try JSON-LD blocks (schema.org/Event)
+    for tag in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data = json.loads(tag.string or "{}")
+        except Exception:
+            continue
+
+        # data can be a dict or list; normalize to list
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if isinstance(item, dict) and item.get("@type") in ("Event", "Festival", "EducationalEvent"):
+                events.append({
+                    "name": item.get("name"),
+                    "start_date": item.get("startDate"),
+                    "end_date": item.get("endDate"),
+                    "location": (item.get("location", {}) or {}).get("name")
+                                 if isinstance(item.get("location"), dict)
+                                 else item.get("location"),
+                    "url": item.get("url"),
+                    "raw": item,
+                })
+
+    # Fallback: parse cards with common MLH selectors
+    if not events:
+        cards = soup.select(".event, .event-wrapper, .event-item, li.event")
+        for c in cards:
+            name = None
+            link = None
+            a = c.find("a")
+            if a:
+                name = a.get_text(strip=True)
+                link = a.get("href")
+
+            # date/location text guesses
+            text = c.get_text(" ", strip=True)
+            # crude location heuristic: look for 'India' or 'Online' words
+            location = None
+            if re.search(r"\bIndia\b", text, re.I):
+                location = "India"
+            elif re.search(r"Online|Virtual", text, re.I):
+                location = "Online"
+
+            events.append({
+                "name": name or "(Unknown)",
+                "start_date": None,
+                "end_date": None,
+                "location": location,
+                "url": link,
+                "raw_text": text[:300],
+            })
+
+    # Drop obvious empties
+    dedup = []
+    seen = set()
+    for e in events:
+        key = (e.get("name"), e.get("url"))
+        if key in seen:
+            continue
+        seen.add(key)
+        # ensure absolute url if needed
+        if e.get("url") and e["url"].startswith("/"):
+            e["url"] = f"https://mlh.io{e['url']}"
+        dedup.append(e)
+
+    return dedup
+
+
+def _fetch_mlh_events(season: str):
+    url = f"https://mlh.io/seasons/{season}/events"
+    headers = {"User-Agent": "mlh-chatbot/1.0 (educational)"}
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    return _parse_events_from_html(r.text)
+
+
+@app.route("/api/hackathons")
+def api_hackathons():
+    # Cache
+    now = time.time()
+    if _events_cache["data"] and (now - _events_cache["fetched_at"]) < _events_cache["ttl"]:
+        events = _events_cache["data"]
+    else:
+        try:
+            events = _fetch_mlh_events(SEASON)
+        except Exception as e:
+            return jsonify({"error": "Failed to fetch MLH events", "details": str(e)}), 502
+        _events_cache["data"] = events
+        _events_cache["fetched_at"] = now
+
+    # Optional filtering via query params
+    q_location = request.args.get("location")  # e.g., India
+    mode = request.args.get("mode")            # online | in-person
+
+    def _matches(e):
+        loc = (e.get("location") or "").lower()
+        ok = True
+        if q_location:
+            ok = ok and (q_location.lower() in loc)
+        if mode == "online":
+            ok = ok and ("online" in loc or "virtual" in loc)
+        elif mode == "in-person":
+            ok = ok and (loc not in ("online", "virtual") and loc != "")
+        return ok
+
+    filtered = [e for e in events if _matches(e)]
+    return jsonify({
+        "season": SEASON,
+        "count": len(filtered),
+        "events": filtered,
+        "cached": (now - _events_cache["fetched_at"]) < _events_cache["ttl"],
+    })
+
+
+# 5) Simple logout (clear session)
+@app.route("/auth/logout")
+def logout():
+    session.clear()
+    return redirect("/")
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)

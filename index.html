@@ -1,0 +1,34 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HackTrack AI</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script> <!-- For API requests -->
+    <script src="https://accounts.google.com/gsi/client" async defer></script> <!-- Google Sign-In -->
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>HackTrack AI</h1>
+            <p>Your AI Companion for Finding Competitions in Real Time</p>
+            <div id="google-signin-button"></div>
+            <button id="logout-button" style="display: none;">Logout</button>
+        </header>
+        <div id="chat-container">
+            <div id="chat-messages"></div>
+            <div id="chat-input">
+                <input type="text" id="user-input" placeholder="Ask about hackathons, competitions...">
+                <button id="send-button">Send</button>
+            </div>
+        </div>
+        <div id="saved-events">
+            <h2>Saved Events</h2>
+            <ul id="saved-list"></ul>
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
